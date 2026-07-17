@@ -79,11 +79,41 @@ async function main() {
     }
   }
 
-  // username fallback
+  // username / new phones
   {
     const { json } = await api('/api/get-user-role', { username: 'grxt777' });
     if (json.ok && json.role === 'director') ok('role username director grxt777');
     else fail('role username director', JSON.stringify(json));
+  }
+  {
+    const { json } = await api('/api/get-user-role', { phone: '998933762109' });
+    if (json.ok && json.role === 'director') ok('role phone director grxt777');
+    else fail('role phone director grxt777', JSON.stringify(json));
+  }
+  {
+    const { json } = await api('/api/get-user-role', { phone: '998996444333' });
+    if (json.ok && json.role === 'director') ok('role phone director javdat_n');
+    else fail('role phone director javdat_n', JSON.stringify(json));
+  }
+  {
+    const { json } = await api('/api/get-user-role', { username: 'javdat_n' });
+    if (json.ok && json.role === 'director') ok('role username director javdat_n');
+    else fail('role username javdat_n', JSON.stringify(json));
+  }
+  {
+    const { json } = await api('/api/get-user-role', { phone: '998975752003' });
+    if (json.ok && json.role === 'manager' && json.branch_id === 3) ok('role phone Shevchenko sob1rov_f1');
+    else fail('role phone Shevchenko', JSON.stringify(json));
+  }
+  {
+    const { json } = await api('/api/get-user-role', { phone: '998931222742' });
+    if (json.ok && json.role === 'manager' && json.branch_id === 5) ok('role phone SeoulMun I_A_R_10');
+    else fail('role phone SeoulMun', JSON.stringify(json));
+  }
+  {
+    const { json } = await api('/api/get-user-role', { phone: '998930005045' });
+    if (json.ok && json.role === 'manager' && json.branch_id === 0) ok('role phone factory nicknet97');
+    else fail('role phone factory', JSON.stringify(json));
   }
   {
     const { json } = await api('/api/get-user-role', { username: 'zubayrmma' });

@@ -258,12 +258,16 @@ export default function Home() {
   const [deliveries, setDeliveries] = useState([]);
   const [tab, setTab] = useState('deliver');
 
-  // Auto role state (phone-first, no manual role switch)
+  // Auto role state (phone-first). Directors may switch view into any role.
   const [leafletLoaded, setLeafletLoaded] = useState(false);
   const [actionLoading, setActionLoading] = useState(null);
   const [roleLoading, setRoleLoading] = useState(true);
   const [matchedBy, setMatchedBy] = useState('');
   const [roleLabel, setRoleLabel] = useState('');
+
+  // Director-only view override (does NOT change real identity)
+  const [viewOverride, setViewOverride] = useState('director'); // director | driver | manager_<id>
+  const [overrideBranchId, setOverrideBranchId] = useState(0);
 
   const [userPhone, setUserPhone] = useState('');
   const [phonePrompt, setPhonePrompt] = useState(false);
@@ -507,9 +511,42 @@ export default function Home() {
     return () => navigator.geolocation.clearWatch(id);
   }, []);
 
-  // Role is automatic — no override switch
-  const activeRole = userRole;
-  const activeBranchId = userBranchId;
+  // Real identity is automatic by phone.
+  // Only directors can temporarily switch UI into driver / any manager view.
+  let activeRole = userRole;
+  let activeBranchId = userBranchId;
+  if (userRole === 'director') {
+    if (viewOverride === 'driver') {
+      activeRole = 'driver';
+      activeBranchId = null;
+    } else if (viewOverride.startsWith('manager_')) {
+      activeRole = 'manager';
+      activeBranchId = Number(viewOverride.split('_')[1]);
+    } else if (viewOverride === 'manager') {
+      activeRole = 'manager';
+      activeBranchId = overrideBranchId != null ? overrideBranchId : (factory?.id || 0);
+    } else {
+      activeRole = 'director';
+      activeBranchId = null;
+    }
+  }
+
+  const onDirectorViewChange = (val) => {
+    if (userRole !== 'director') return;
+    setViewOverride(val);
+    if (val.startsWith('manager_')) {
+      setOverrideBranchId(Number(val.split('_')[1]));
+    } else if (val === 'manager') {
+      setOverrideBranchId(factory?.id || 0);
+    }
+    // reset driver wizard when jumping views
+    setStep('choose');
+    setSelectedBranch(null);
+    setResult(null);
+    setError('');
+    setManagerFlash(null);
+    setTab('deliver');
+  };
 
   // Load Driver History
   const loadHistory = useCallback(() => {
@@ -821,6 +858,29 @@ export default function Home() {
 
   return (
     <main style={c.container}>
+      {/* Director-only role view switcher */}
+      {userRole === 'director' && (
+        <div style={c.switcherContainer}>
+          <div style={c.switcherLabel}>Режим (только директор):</div>
+          <select
+            style={c.switcherSelect}
+            value={viewOverride}
+            onChange={(e) => onDirectorViewChange(e.target.value)}
+          >
+            <option value="director">👑 Панель Директора</option>
+            <option value="driver">🚚 Режим Развозчика</option>
+            <optgroup label="Режим Управляющего">
+              {factory && (
+                <option value={`manager_${factory.id}`}>🏭 {factory.name}</option>
+              )}
+              {branches.map((b) => (
+                <option key={b.id} value={`manager_${b.id}`}>🏢 {b.name}</option>
+              ))}
+            </optgroup>
+          </select>
+        </div>
+      )}
+
       {/* Header */}
       <div style={c.header}>
         <div style={c.headerTitleContainer}>
@@ -845,6 +905,7 @@ export default function Home() {
           {activeRole === 'manager' && managerActiveBranch ? `${managerActiveBranch.name} · ` : ''}
           {roleLabel || (user ? user.first_name || user.username : driverInfo?.name || 'Развозчик')}
           {matchedBy === 'phone' ? ' · 📱' : matchedBy === 'username' ? ' · @' : matchedBy === 'db' ? ' · DB' : ''}
+          {userRole === 'director' && activeRole !== 'director' ? ' · 👁 просмотр' : ''}
         </div>
       </div>
 
@@ -1431,28 +1492,10 @@ const c = {
     fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', 
     paddingBottom: 40 
   },
-  debugBar: {
-    background: '#f4f4f5',
-    borderBottom: '1px solid #e4e4e7',
-    padding: '8px 20px',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 10,
-  },
-  debugSelect: {
-    padding: '4px 8px',
-    borderRadius: 6,
-    border: '1px solid #d4d4d8',
-    background: '#ffffff',
-    fontSize: 12,
-    fontWeight: 500,
-    outline: 'none',
-  },
   switcherContainer: {
     padding: '12px 20px',
-    background: '#ffffff',
-    borderBottom: '1px solid #f4f4f5',
+    background: '#fafafa',
+    borderBottom: '1px solid #e4e4e7',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -1462,9 +1505,12 @@ const c = {
     fontSize: 12,
     fontWeight: 600,
     color: '#71717a',
+    whiteSpace: 'nowrap',
   },
   switcherSelect: {
-    padding: '6px 12px',
+    flex: 1,
+    maxWidth: 260,
+    padding: '8px 12px',
     borderRadius: 8,
     border: '1px solid #e4e4e7',
     background: '#ffffff',
