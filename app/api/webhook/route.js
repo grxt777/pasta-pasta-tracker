@@ -12,12 +12,14 @@ export async function POST(request) {
 
   try {
     const body = await request.json();
-    // Process update in background — return 200 quickly so Telegram doesn't retry
-    handleUpdate(body).catch((e) => console.error('Webhook handler error:', e));
+    // MUST await on Vercel — fire-and-forget freezes before callback_query is answered
+    // (buttons appear "dead" if answerCallbackQuery never runs).
+    await handleUpdate(body);
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error('Webhook error:', e);
-    return NextResponse.json({ ok: false }, { status: 500 });
+    // Still 200 for Telegram so it does not spam retries forever on our bugs
+    return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 200 });
   }
 }
 
