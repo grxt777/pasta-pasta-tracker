@@ -269,6 +269,15 @@ export default function Home() {
   const [phonePrompt, setPhonePrompt] = useState(false);
   const [manualPhone, setManualPhone] = useState('');
   const [phoneBusy, setPhoneBusy] = useState(false);
+  const [phoneAutoTried, setPhoneAutoTried] = useState(false);
+  // If phone already cached — don't block UI with gate on first paint
+  const [identityGate, setIdentityGate] = useState(() => {
+    try {
+      return !localStorage.getItem('ppt_phone');
+    } catch {
+      return true;
+    }
+  });
 
   // Director access list & management
   const [directorTab, setDirectorTab] = useState('activity');
@@ -283,6 +292,7 @@ export default function Home() {
   const [todayStats, setTodayStats] = useState({ confirmed: 0, rejected: 0, pending: 0, total: 0 });
   const [directorDeliveries, setDirectorDeliveries] = useState([]);
   const [managerDeliveries, setManagerDeliveries] = useState([]);
+  const [managerFlash, setManagerFlash] = useState(null); // intermediate confirm screen
 
   const isTelegram =
     typeof window !== 'undefined' &&
@@ -312,42 +322,80 @@ export default function Home() {
   useEffect(() => {
     try {
       const cached = localStorage.getItem('ppt_phone');
-      if (cached) setUserPhone(cached);
+      if (cached) {
+        setUserPhone(cached);
+        setPhonePrompt(false);
+      }
     } catch {}
   }, []);
 
-  useEffect(() => {
-    if (typeof window !== 'undefined' && window.Telegram?.WebApp) {
-      const w = window.Telegram.WebApp;
-      try {
-        w.ready();
-        w.expand();
-        if (w.setHeaderColor) w.setHeaderColor('#ffffff');
-        if (w.setBackgroundColor) w.setBackgroundColor('#ffffff');
-      } catch {}
-      setUser(w.initDataUnsafe?.user || null);
-
-      // Listen for contact share (phone auto-role)
-      const onContact = (event) => {
-        try {
-          const phone =
-            event?.responseUnsafe?.contact?.phone_number ||
-            event?.contact?.phone_number ||
-            '';
-          if (phone) {
-            const digits = String(phone).replace(/\D/g, '');
-            setUserPhone(digits);
-            try { localStorage.setItem('ppt_phone', digits); } catch {}
-            setPhonePrompt(false);
-          }
-        } catch {}
-      };
-      try { w.onEvent && w.onEvent('contactRequested', onContact); } catch {}
-      return () => {
-        try { w.offEvent && w.offEvent('contactRequested', onContact); } catch {}
-      };
-    }
+  const applyPhone = useCallback((raw) => {
+    if (!raw) return false;
+    const digits = String(raw).replace(/\D/g, '');
+    if (digits.length < 9) return false;
+    setUserPhone(digits);
+    try { localStorage.setItem('ppt_phone', digits); } catch {}
+    setPhonePrompt(false);
+    setPhoneBusy(false);
+    return true;
   }, []);
+
+  const requestTelegramPhone = useCallback((opts = {}) => {
+    const silent = !!opts.silent;
+    const w = typeof window !== 'undefined' ? window.Telegram?.WebApp : null;
+    if (!w || typeof w.requestContact !== 'function') {
+      if (!silent) setPhonePrompt(true);
+      return;
+    }
+    setPhoneBusy(true);
+    try {
+      w.requestContact((sent, event) => {
+        setPhoneBusy(false);
+        if (!sent) {
+          // User dismissed — show compact gate with retry (no free-text by default)
+          setPhonePrompt(true);
+          return;
+        }
+        const phone =
+          event?.responseUnsafe?.contact?.phone_number ||
+          event?.contact?.phone_number ||
+          event?.responseUnsafe?.phone_number ||
+          '';
+        if (!applyPhone(phone)) setPhonePrompt(true);
+      });
+    } catch {
+      setPhoneBusy(false);
+      if (!silent) setPhonePrompt(true);
+    }
+  }, [applyPhone]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.Telegram?.WebApp) return;
+    const w = window.Telegram.WebApp;
+    try {
+      w.ready();
+      w.expand();
+      if (w.setHeaderColor) w.setHeaderColor('#ffffff');
+      if (w.setBackgroundColor) w.setBackgroundColor('#ffffff');
+    } catch {}
+    setUser(w.initDataUnsafe?.user || null);
+
+    // Listen for contact share (phone auto-role)
+    const onContact = (event) => {
+      try {
+        const phone =
+          event?.responseUnsafe?.contact?.phone_number ||
+          event?.contact?.phone_number ||
+          event?.responseUnsafe?.phone_number ||
+          '';
+        applyPhone(phone);
+      } catch {}
+    };
+    try { w.onEvent && w.onEvent('contactRequested', onContact); } catch {}
+    return () => {
+      try { w.offEvent && w.offEvent('contactRequested', onContact); } catch {}
+    };
+  }, [applyPhone]);
 
   // Fetch branches
   useEffect(() => {
@@ -363,7 +411,6 @@ export default function Home() {
   }, []);
 
   // Auto role: phone (preferred) → username → default driver
-  // No manual role switch — identity is resolved only from phone/username.
   const refreshRole = useCallback(() => {
     const u = user?.username || '';
     const tid = user?.id || '';
@@ -384,11 +431,20 @@ export default function Home() {
           setUserBranchId(d.branch_id ?? null);
           setMatchedBy(d.matched_by || '');
           setRoleLabel(d.label || '');
-          // Ask for phone if not matched by phone yet (username-only is ok but phone is preferred)
-          if (!userPhone && d.matched_by !== 'phone' && d.matched_by !== 'db') {
-            setPhonePrompt(true);
-          } else {
+
+          const known =
+            d.matched_by === 'phone' ||
+            d.matched_by === 'username' ||
+            d.matched_by === 'db' ||
+            !!userPhone;
+
+          if (known) {
+            setIdentityGate(false);
             setPhonePrompt(false);
+          } else {
+            // Unknown person — auto-request Telegram contact (no typing)
+            setIdentityGate(true);
+            setPhonePrompt(true);
           }
         }
       })
@@ -400,48 +456,45 @@ export default function Home() {
     refreshRole();
   }, [refreshRole]);
 
-  const requestTelegramPhone = () => {
-    const w = typeof window !== 'undefined' ? window.Telegram?.WebApp : null;
-    if (!w) {
-      setPhonePrompt(true);
+  // Automatically request contact once when opened in Telegram and identity unknown
+  useEffect(() => {
+    if (phoneAutoTried) return;
+    if (userPhone) {
+      setPhoneAutoTried(true);
       return;
     }
-    setPhoneBusy(true);
-    try {
-      if (typeof w.requestContact === 'function') {
-        w.requestContact((sent, event) => {
-          setPhoneBusy(false);
-          if (!sent) return;
-          const phone =
-            event?.responseUnsafe?.contact?.phone_number ||
-            event?.contact?.phone_number ||
-            '';
-          if (phone) {
-            const digits = String(phone).replace(/\D/g, '');
-            setUserPhone(digits);
-            try { localStorage.setItem('ppt_phone', digits); } catch {}
-            setPhonePrompt(false);
-          }
-        });
-      } else {
-        setPhoneBusy(false);
-        setPhonePrompt(true);
-      }
-    } catch {
-      setPhoneBusy(false);
-      setPhonePrompt(true);
+    // Wait a tick for Telegram SDK + username role resolution
+    if (roleLoading) return;
+
+    const inTg =
+      typeof window !== 'undefined' &&
+      window.Telegram?.WebApp &&
+      (window.Telegram.WebApp.initData || window.Telegram.WebApp.initDataUnsafe?.user);
+
+    if (!inTg) {
+      // Outside Telegram: show contact gate (manual only as last resort)
+      if (matchedBy === 'default' || !matchedBy) setPhonePrompt(true);
+      setPhoneAutoTried(true);
+      return;
     }
-  };
+
+    // If already matched by username/db — no need for contact
+    if (matchedBy === 'username' || matchedBy === 'db' || matchedBy === 'phone') {
+      setPhoneAutoTried(true);
+      setIdentityGate(false);
+      return;
+    }
+
+    setPhoneAutoTried(true);
+    // Auto popup contact request
+    const t = setTimeout(() => requestTelegramPhone({ silent: false }), 350);
+    return () => clearTimeout(t);
+  }, [phoneAutoTried, userPhone, roleLoading, matchedBy, requestTelegramPhone]);
 
   const submitManualPhone = () => {
-    const digits = String(manualPhone || '').replace(/\D/g, '');
-    if (digits.length < 9) {
+    if (!applyPhone(manualPhone)) {
       alert('Введите номер полностью, например +998901234567');
-      return;
     }
-    setUserPhone(digits);
-    try { localStorage.setItem('ppt_phone', digits); } catch {}
-    setPhonePrompt(false);
   };
 
   useEffect(() => {
@@ -549,9 +602,19 @@ export default function Home() {
         }),
       });
       const d = await r.json();
-      if (d.ok) { setResult(d); setStep('done'); }
-      else setError(d.message || d.error || 'Ошибка');
-    } catch { setError('Ошибка соединения'); }
+      if (d.ok) {
+        setResult({ ...d, type });
+        setStep(type === 'pickup' ? 'done_pickup' : 'done_delivery');
+        // refresh history in background
+        loadHistory();
+      } else {
+        setError(d.message || d.error || 'Ошибка');
+        setStep('error');
+      }
+    } catch {
+      setError('Ошибка соединения');
+      setStep('error');
+    }
     setLoading(false);
   };
 
@@ -559,13 +622,25 @@ export default function Home() {
     setActionLoading(deliveryId);
     try {
       const managerId = user?.id || 9999;
-      const managerName = user?.first_name || user?.username || 'Управляющий';
+      const managerName = user?.first_name || user?.username || roleLabel || 'Управляющий';
       const r = await fetch(`${API}/api/confirm-delivery`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ delivery_id: deliveryId, status, manager_id: managerId, manager_name: managerName }),
       });
       const d = await r.json();
       if (d.ok) {
+        const item = managerDeliveries.find((x) => Number(x.id) === Number(deliveryId));
+        const branchName =
+          item?.branch_name ||
+          branches.find((b) => b.id === activeBranchId)?.name ||
+          (factory?.id === activeBranchId ? factory?.name : '') ||
+          '';
+        setManagerFlash({
+          status,
+          branch_name: branchName,
+          driver_name: item?.driver_name || '',
+          type: item?.type,
+        });
         loadBranchHistory();
         if (userRole === 'director') loadDirectorStats();
       } else {
@@ -638,7 +713,21 @@ export default function Home() {
     }
   };
 
-  const reset = () => { setStep('choose'); setSelectedBranch(null); setResult(null); setError(''); };
+  const reset = () => {
+    setStep('choose');
+    setSelectedBranch(null);
+    setResult(null);
+    setError('');
+    setTab('deliver');
+  };
+
+  const goToHistory = () => {
+    setTab('history');
+    setStep('choose');
+    setResult(null);
+    setError('');
+    loadHistory();
+  };
 
   const statusStyles = {
     confirmed: {
@@ -667,33 +756,71 @@ export default function Home() {
   const managerActiveBranch = branches.find(b => b.id === activeBranchId) || 
                               (factory?.id === activeBranchId ? factory : null);
 
-  return (
-    <main style={c.container}>
-      {/* Phone identity — sole way to select role (automatic) */}
-      {phonePrompt && (
-        <div style={c.phoneBanner}>
-          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>📱 Вход по номеру телефона</div>
-          <div style={{ fontSize: 12, color: '#52525b', lineHeight: 1.4, marginBottom: 10 }}>
-            Роль (развозчик / управляющий / директор) определяется <b>только по номеру</b>. Переключателя ролей нет.
-          </div>
-          {isTelegram && (
-            <button style={c.phoneBtn} onClick={requestTelegramPhone} disabled={phoneBusy}>
-              {phoneBusy ? 'Ожидание…' : 'Отправить номер из Telegram'}
-            </button>
-          )}
-          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-            <input
-              type="tel"
-              placeholder="+998 XX XXX XX XX"
-              value={manualPhone}
-              onChange={(e) => setManualPhone(e.target.value)}
-              style={c.phoneInput}
-            />
-            <button style={c.phoneBtnSecondary} onClick={submitManualPhone}>Войти</button>
+  // Full-screen identity gate until phone/username resolved
+  if (identityGate && (roleLoading || phonePrompt || (!userPhone && matchedBy === 'default'))) {
+    return (
+      <main style={c.container}>
+        <div style={c.gateWrap}>
+          <div style={c.gateCard}>
+            <div style={c.gateIcon}>📱</div>
+            <div style={c.gateTitle}>Определяем, кто вы</div>
+            <div style={c.gateSub}>
+              Роль назначается <b>автоматически по номеру телефона</b>.
+              {isTelegram
+                ? ' Сейчас запросим контакт из Telegram — ничего вводить не нужно.'
+                : ' Откройте приложение из Telegram-бота, чтобы поделиться контактом.'}
+            </div>
+
+            {roleLoading && !phonePrompt && (
+              <div style={c.gateLoading}>Загрузка…</div>
+            )}
+
+            {phoneBusy && (
+              <div style={c.gateLoading}>Ожидаем контакт…</div>
+            )}
+
+            {isTelegram && (
+              <button
+                style={c.phoneBtn}
+                disabled={phoneBusy}
+                onClick={() => requestTelegramPhone()}
+              >
+                {phoneBusy ? 'Откройте окно Telegram…' : '📱 Поделиться контактом'}
+              </button>
+            )}
+
+            {!isTelegram && (
+              <div style={c.gateHint}>
+                Вне Telegram номер можно указать вручную (только для теста):
+                <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                  <input
+                    type="tel"
+                    placeholder="+998…"
+                    value={manualPhone}
+                    onChange={(e) => setManualPhone(e.target.value)}
+                    style={c.phoneInput}
+                  />
+                  <button style={c.phoneBtnSecondary} onClick={submitManualPhone}>OK</button>
+                </div>
+              </div>
+            )}
+
+            {isTelegram && phonePrompt && !phoneBusy && (
+              <button
+                style={{ ...c.linkBtn, marginTop: 14 }}
+                onClick={() => requestTelegramPhone()}
+              >
+                Запросить контакт снова
+              </button>
+            )}
           </div>
         </div>
-      )}
+      </main>
+    );
+  }
 
+  return (
+    <main style={c.container}>
       {/* Header */}
       <div style={c.header}>
         <div style={c.headerTitleContainer}>
@@ -718,26 +845,7 @@ export default function Home() {
           {activeRole === 'manager' && managerActiveBranch ? `${managerActiveBranch.name} · ` : ''}
           {roleLabel || (user ? user.first_name || user.username : driverInfo?.name || 'Развозчик')}
           {matchedBy === 'phone' ? ' · 📱' : matchedBy === 'username' ? ' · @' : matchedBy === 'db' ? ' · DB' : ''}
-          {userPhone ? ` · +${String(userPhone).replace(/^\+/, '')}` : ''}
         </div>
-        {!userPhone && (
-          <button style={c.linkBtn} onClick={() => { setPhonePrompt(true); if (isTelegram) requestTelegramPhone(); }}>
-            Указать телефон
-          </button>
-        )}
-        {userPhone && (
-          <button
-            style={c.linkBtn}
-            onClick={() => {
-              setUserPhone('');
-              try { localStorage.removeItem('ppt_phone'); } catch {}
-              setPhonePrompt(true);
-              setManualPhone('');
-            }}
-          >
-            Сменить номер
-          </button>
-        )}
       </div>
 
       {/* RENDER VIEW ACCORDING TO ROLE */}
@@ -955,8 +1063,36 @@ export default function Home() {
       {/* ─────────────────── MANAGER ROLE ─────────────────── */}
       {activeRole === 'manager' && (
         <div style={c.content}>
+          {managerFlash && (
+            <div style={c.successScreen}>
+              <div style={{
+                ...c.successCircle,
+                background: managerFlash.status === 'confirmed' ? '#f0fdf4' : '#fef2f2',
+                border: managerFlash.status === 'confirmed' ? '1px solid #bbf7d0' : '1px solid #fecaca',
+              }}>
+                {managerFlash.status === 'confirmed'
+                  ? <CheckIcon size={28} color="#16a34a" />
+                  : <CloseIcon size={28} color="#dc2626" />}
+              </div>
+              <div style={{
+                ...c.successTitle,
+                color: managerFlash.status === 'confirmed' ? '#166534' : '#991b1b',
+              }}>
+                {managerFlash.status === 'confirmed' ? 'Вы подтвердили' : 'Вы отклонили'}
+              </div>
+              <div style={c.successSub}>
+                {managerFlash.type === 'pickup' ? 'Забор с фабрики' : 'Доставка'} · {managerFlash.driver_name}
+                {managerFlash.branch_name ? ` · ${managerFlash.branch_name}` : ''}
+              </div>
+              <div style={{ fontSize: 12, color: '#71717a', marginBottom: 8 }}>
+                Статус сохранён в базе и отправлен в группу
+              </div>
+              <button style={c.submit} onClick={() => setManagerFlash(null)}>К списку</button>
+            </div>
+          )}
+
           {/* List Pending */}
-          {(() => {
+          {!managerFlash && (() => {
             const pending = managerDeliveries.filter(d => d.status === 'pending');
             return pending.length > 0 ? (
               <div style={c.pendingSection}>
@@ -1016,49 +1152,55 @@ export default function Home() {
           })()}
 
           {/* History */}
-          <div style={c.label}>История филиала</div>
-          {managerDeliveries.filter(d => d.status !== 'pending').length === 0 ? (
-            <div style={c.empty}>История пуста</div>
-          ) : (
-            <div style={c.histList}>
-              {managerDeliveries.filter(d => d.status !== 'pending').map(d => {
-                const status = statusStyles[d.status] || statusStyles.pending;
-                return (
-                  <div key={d.id} style={c.histCard}>
-                    <div style={c.histTop}>
-                      <span style={c.histTypeIcon}>
-                        {d.type === 'pickup' ? <PackageIcon size={14} /> : <TruckIcon size={14} />}
-                      </span>
-                      <span style={{ 
-                        ...c.histStatusContainer, 
-                        color: status.color,
-                        background: status.bg,
-                        border: `1px solid ${status.border}`
-                      }}>
-                        {status.icon(12)}
-                        <span>{status.label}</span>
-                      </span>
-                    </div>
-                    <div style={c.histBr}>{d.driver_name}</div>
-                    <div style={c.histMeta}>
-                      <div style={c.histMetaItem}>
-                        <ClockIcon size={12} />
-                        <span>{d.created_at}</span>
-                      </div>
-                      <div style={c.histMetaItem}>
-                        <NavigationIcon size={12} />
-                        <span>{d.distance} м</span>
-                      </div>
-                      {d.confirmed_by_name && (
-                        <div style={c.histMetaItem}>
-                          <span>🧑‍💼 {d.confirmed_by_name}</span>
+          {!managerFlash && (
+            <>
+              <div style={c.label}>История филиала</div>
+              {managerDeliveries.filter(d => d.status !== 'pending').length === 0 ? (
+                <div style={c.empty}>История пуста</div>
+              ) : (
+                <div style={c.histList}>
+                  {managerDeliveries.filter(d => d.status !== 'pending').map(d => {
+                    const status = statusStyles[d.status] || statusStyles.pending;
+                    const typeLabel = d.type === 'pickup' ? 'Забор' : 'Доставка';
+                    return (
+                      <div key={d.id} style={c.histCard}>
+                        <div style={c.histTop}>
+                          <span style={c.histTypeIcon}>
+                            {d.type === 'pickup' ? <PackageIcon size={14} /> : <TruckIcon size={14} />}
+                          </span>
+                          <span style={{
+                            ...c.histStatusContainer,
+                            color: status.color,
+                            background: status.bg,
+                            border: `1px solid ${status.border}`
+                          }}>
+                            {status.icon(12)}
+                            <span>{status.label}</span>
+                          </span>
                         </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+                        <div style={c.histTypeLabel}>{typeLabel}</div>
+                        <div style={c.histBr}>{d.driver_name}</div>
+                        <div style={c.histMeta}>
+                          <div style={c.histMetaItem}>
+                            <ClockIcon size={12} />
+                            <span>{d.created_at}</span>
+                          </div>
+                          <div style={c.histMetaItem}>
+                            <NavigationIcon size={12} />
+                            <span>{d.distance} м</span>
+                          </div>
+                          {d.confirmed_by_name && (
+                            <div style={c.histMetaItem}>
+                              <span>🧑‍💼 {d.confirmed_by_name}</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
@@ -1159,48 +1301,90 @@ export default function Home() {
                 </>
               )}
 
-              {step === 'done' && result && (
-                <div style={c.resOk}>
-                  <div style={c.resOkIcon}>
-                    <CheckIcon size={22} color="#16a34a" />
+              {/* Intermediate success: pickup */}
+              {step === 'done_pickup' && result && (
+                <div style={c.successScreen}>
+                  <div style={c.successCircle}>
+                    <PackageIcon size={28} color="#16a34a" />
                   </div>
-                  <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 2 }}>Отправлено!</div>
-                  <div style={{ fontWeight: 500, fontSize: 14 }}>{result.branch_name}</div>
-                  <div style={{ fontSize: 12, opacity: 0.8, marginTop: 1 }}>{result.distance} м от точки</div>
-                  <div style={{ fontSize: 12, opacity: 0.6, marginTop: 12, lineHeight: 1.4 }}>Ожидайте подтверждения управляющего</div>
-                  <button style={c.again} onClick={reset}>Новая доставка</button>
+                  <div style={c.successTitle}>Вы забрали заказ</div>
+                  <div style={c.successSub}>
+                    Отметка с фабрики сохранена и отправлена управляющему.
+                  </div>
+                  <div style={c.successCard}>
+                    <div style={c.successRow}><span>📍</span><span>{result.branch_name || factory?.name || 'Фабрика'}</span></div>
+                    <div style={c.successRow}><span>📏</span><span>{result.distance} м от точки</span></div>
+                    <div style={c.successRow}><span>🆔</span><span>#{result.delivery_id}</span></div>
+                    <div style={c.successRow}><span>⏳</span><span>Ожидает подтверждения</span></div>
+                  </div>
+                  <button style={c.submit} onClick={reset}>
+                    <TruckIcon size={16} />
+                    <span>Доставить на филиал</span>
+                  </button>
+                  <button style={c.again} onClick={goToHistory}>Открыть историю</button>
                 </div>
               )}
 
-              {error && (
+              {/* Intermediate success: delivery */}
+              {step === 'done_delivery' && result && (
+                <div style={c.successScreen}>
+                  <div style={c.successCircle}>
+                    <CheckIcon size={28} color="#16a34a" />
+                  </div>
+                  <div style={c.successTitle}>Вы доставили заказ</div>
+                  <div style={c.successSub}>
+                    Доставка на филиал зафиксирована. Ждём подтверждение управляющего.
+                  </div>
+                  <div style={c.successCard}>
+                    <div style={c.successRow}><span>🏢</span><span>{result.branch_name}</span></div>
+                    <div style={c.successRow}><span>📏</span><span>{result.distance} м от точки</span></div>
+                    <div style={c.successRow}><span>🆔</span><span>#{result.delivery_id}</span></div>
+                    <div style={c.successRow}><span>⏳</span><span>Статус: ожидает</span></div>
+                  </div>
+                  <button style={c.submit} onClick={reset}>
+                    <span>Новая отметка</span>
+                  </button>
+                  <button style={c.again} onClick={goToHistory}>Смотреть историю</button>
+                </div>
+              )}
+
+              {(step === 'error' || (error && step !== 'done_pickup' && step !== 'done_delivery')) && error && (
                 <div style={c.resErr}>
                   <div style={c.resErrIcon}>
                     <CloseIcon size={22} color="#dc2626" />
                   </div>
                   <div style={{ fontWeight: 600, fontSize: 14, lineHeight: 1.4 }}>{error}</div>
-                  <button style={c.againR} onClick={() => setError('')}>Понятно</button>
+                  <button style={c.againR} onClick={() => { setError(''); setStep('choose'); }}>Понятно</button>
                 </div>
               )}
             </div>
           ) : (
             <div style={c.content}>
+              <div style={c.label}>Ваша история</div>
               {deliveries.length === 0 ? (
                 <div style={c.empty}>
                   <ClipboardIcon size={28} style={{ marginBottom: 4 }} />
-                  <div>Нет доставок</div>
+                  <div>Пока нет отметок</div>
+                  <div style={{ fontSize: 12, color: '#a1a1aa', marginTop: 4 }}>
+                    Заборы и доставки появятся здесь
+                  </div>
+                  <button style={{ ...c.again, marginTop: 16 }} onClick={() => { setTab('deliver'); reset(); }}>
+                    Сделать первую отметку
+                  </button>
                 </div>
               ) : (
                 <div style={c.histList}>
                   {deliveries.map(d => {
                     const status = statusStyles[d.status] || statusStyles.pending;
+                    const typeLabel = d.type === 'pickup' ? 'Забор с фабрики' : 'Доставка на филиал';
                     return (
                       <div key={d.id} style={c.histCard}>
                         <div style={c.histTop}>
                           <span style={c.histTypeIcon}>
                             {d.type === 'pickup' ? <PackageIcon size={15} /> : <TruckIcon size={15} />}
                           </span>
-                          <span style={{ 
-                            ...c.histStatusContainer, 
+                          <span style={{
+                            ...c.histStatusContainer,
                             color: status.color,
                             background: status.bg,
                             border: `1px solid ${status.border}`
@@ -1209,6 +1393,7 @@ export default function Home() {
                             <span>{status.label}</span>
                           </span>
                         </div>
+                        <div style={c.histTypeLabel}>{typeLabel}</div>
                         <div style={c.histBr}>{d.branch_name}</div>
                         <div style={c.histMeta}>
                           <div style={c.histMetaItem}>
@@ -1219,6 +1404,11 @@ export default function Home() {
                             <NavigationIcon size={12} />
                             <span>{d.distance} м</span>
                           </div>
+                          {d.id != null && (
+                            <div style={c.histMetaItem}>
+                              <span>#{d.id}</span>
+                            </div>
+                          )}
                         </div>
                       </div>
                     );
@@ -2014,12 +2204,12 @@ const c = {
   },
   phoneBtn: {
     width: '100%',
-    padding: '12px 14px',
-    borderRadius: 10,
+    padding: '14px 14px',
+    borderRadius: 12,
     border: 'none',
     background: '#18181b',
     color: '#fff',
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: 600,
     cursor: 'pointer',
   },
@@ -2052,5 +2242,101 @@ const c = {
     fontWeight: 600,
     cursor: 'pointer',
     textDecoration: 'underline',
+  },
+
+  // Identity gate (auto contact)
+  gateWrap: {
+    minHeight: '100vh',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+    background: '#ffffff',
+  },
+  gateCard: {
+    width: '100%',
+    maxWidth: 360,
+    textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: 10,
+  },
+  gateIcon: { fontSize: 40, lineHeight: 1 },
+  gateTitle: { fontSize: 20, fontWeight: 700, color: '#18181b', letterSpacing: '-0.3px' },
+  gateSub: { fontSize: 13, color: '#71717a', lineHeight: 1.5, marginBottom: 8 },
+  gateLoading: { fontSize: 13, color: '#a1a1aa', padding: '8px 0 4px' },
+  gateHint: {
+    width: '100%',
+    marginTop: 12,
+    padding: 12,
+    borderRadius: 12,
+    background: '#fafafa',
+    border: '1px solid #e4e4e7',
+    fontSize: 12,
+    color: '#71717a',
+    textAlign: 'left',
+  },
+
+  // Intermediate success screens
+  successScreen: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    textAlign: 'center',
+    padding: '12px 4px 8px',
+    gap: 8,
+  },
+  successCircle: {
+    width: 72,
+    height: 72,
+    borderRadius: '50%',
+    background: '#f0fdf4',
+    border: '1px solid #bbf7d0',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 6,
+  },
+  successTitle: {
+    fontSize: 20,
+    fontWeight: 700,
+    color: '#166534',
+    letterSpacing: '-0.3px',
+  },
+  successSub: {
+    fontSize: 13,
+    color: '#4d7c0f',
+    lineHeight: 1.45,
+    maxWidth: 300,
+    marginBottom: 6,
+  },
+  successCard: {
+    width: '100%',
+    textAlign: 'left',
+    background: '#f0fdf4',
+    border: '1px solid #bbf7d0',
+    borderRadius: 14,
+    padding: '14px 16px',
+    margin: '8px 0 12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+  },
+  successRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    fontSize: 13,
+    fontWeight: 500,
+    color: '#166534',
+  },
+  histTypeLabel: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: '#71717a',
+    textTransform: 'uppercase',
+    letterSpacing: '0.6px',
+    marginBottom: 2,
   },
 };
